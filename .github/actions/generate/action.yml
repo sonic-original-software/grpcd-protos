@@ -1,0 +1,58 @@
+name: Generate and Push Proto Code
+description: Generates proto code for a specific ecosystem and pushes to a dedicated branch
+
+inputs:
+  ecosystem:
+    description: 'The target ecosystem/language (e.g., go, python, rust)'
+    required: true
+  github-token:
+    description: 'GitHub token for protoc setup'
+    required: true
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install protoc
+      uses: arduino/setup-protoc@v3
+      with:
+        repo-token: ${{ inputs.github-token }}
+
+    - name: Install Task
+      uses: go-task/setup-task@v1
+
+    - name: Generate code from protos
+      shell: bash
+      run: task gen-${{ inputs.ecosystem }}
+
+    - name: Stage generated code
+      shell: bash
+      run: git add --force ${{ inputs.ecosystem }}/
+
+    - name: Create tree from ecosystem directory
+      id: tree
+      shell: bash
+      run: |
+        TREE=$(git write-tree --prefix=${{ inputs.ecosystem }}/)
+        echo "TREE=${TREE}" >> $GITHUB_OUTPUT
+
+    - name: Configure git
+      shell: bash
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+    - name: Create orphan commit
+      id: commit
+      shell: bash
+      run: |
+        COMMIT=$(git commit-tree ${{ steps.tree.outputs.TREE }} -m "Generated ${{ inputs.ecosystem }} code from protos")
+        echo "COMMIT=${COMMIT}" >> $GITHUB_OUTPUT
+
+    - name: Update branch
+      shell: bash
+      run: git branch -f gen-${{ inputs.ecosystem }} ${{ steps.commit.outputs.COMMIT }}
+
+    - name: Push
+      shell: bash
+      run: git push --force origin gen-${{ inputs.ecosystem }}

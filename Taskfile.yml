@@ -5,16 +5,23 @@ version: "3"
 silent: true
 
 vars:
-  MODULE:
-    sh: go list -m
+  GO_MODULE:
+    sh: go -C go list -m
 
 tasks:
   default: task --list-all
 
-  proto-gen:
+  gen-go:
     silent: false
-    cmd: |-
-      protoc -Iprotos \
-      --go_out=. --go_opt=paths=import --go_opt=module={{.MODULE}} \
-      --go-grpc_out=. --go-grpc_opt=paths=import --go-grpc_opt=module={{.MODULE}} \
-        protos/**/*.proto
+    cmds:
+      - 'echo "Generating code for go module: {{.GO_MODULE}}"'
+      - |-
+        protoc -Iprotos \
+          --go_out=go --go_opt=paths=import --go_opt=module={{.GO_MODULE}} \
+          --go-grpc_out=go --go-grpc_opt=paths=import --go-grpc_opt=module={{.GO_MODULE}} \
+          protos/**/*.proto
+
+  gen:
+    silent: false
+    cmds:
+      - task: gen-go
