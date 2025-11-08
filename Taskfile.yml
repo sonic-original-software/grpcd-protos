@@ -1,0 +1,20 @@
+# https://taskfile.dev
+
+version: "3"
+
+silent: true
+
+vars:
+  MODULE:
+    sh: go list -m
+
+tasks:
+  default: task --list-all
+
+  proto-gen:
+    silent: false
+    cmd: |-
+      protoc -Iprotos \
+      --go_out=. --go_opt=paths=import --go_opt=module={{.MODULE}} \
+      --go-grpc_out=. --go-grpc_opt=paths=import --go-grpc_opt=module={{.MODULE}} \
+        protos/**/*.proto

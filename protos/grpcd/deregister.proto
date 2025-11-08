@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+package grpcd;
+
+option go_package = "git.sonicoriginal.software/grpcd-go/lib;grpcd";
+
+// Service deregistration request
+message DeregisterRequest {}
+
+// Service deregistration response
+message DeregisterResponse {}

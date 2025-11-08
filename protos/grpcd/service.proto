@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package grpcd;
+
+import "grpcd/deregister.proto";
+import "grpcd/discover.proto";
+import "grpcd/register.proto";
+
+option go_package = "git.sonicoriginal.software/grpcd-go/lib;grpcd";
+
+// GRPCDService handles service registration and method discovery
+service GRPCDService {
+  // Register a service instance with its methods
+  rpc Register(grpcd.RegisterRequest) returns (grpcd.RegisterResponse);
+
+  // Deregister a service instance
+  rpc Deregister(grpcd.DeregisterRequest) returns (grpcd.DeregisterResponse);
+
+  // Discover address for a specific method
+  rpc Discover(grpcd.DiscoverRequest) returns (grpcd.DiscoverResponse);
+}

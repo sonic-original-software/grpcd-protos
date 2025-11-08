@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package grpcd;
+
+option go_package = "git.sonicoriginal.software/grpcd-go/lib;grpcd";
+
+// Query for a specific method
+message DiscoverRequest {
+  // The fully qualified method name (e.g., "principal.PrincipalService.CreatePrincipal")
+  string method_name = 1;
+}
+
+message DiscoverResponse {
+  // Address of a service that handles the requested method
+  // e.g., "10.0.1.10:50054"
+  string address = 1;
+}

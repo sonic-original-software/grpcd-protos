@@ -1,0 +1,69 @@
+name: Release Generated Proto Code
+
+on:
+  push:
+    branches:
+      - gen
+
+jobs:
+  generate:
+    # Disabled for the time being
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout gen branch
+        uses: actions/checkout@v5
+        with:
+          ref: gen
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Go plugins
+        run: |
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+
+      - name: Generate version tag
+        id: version
+        run: |
+          TIMESTAMP=$(date -u +%Y.%m%d.%H%M)
+          VERSION="v${TIMESTAMP}"
+          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Install Task
+        uses: go-task/setup-task@v1
+
+      - name: Generate proto code
+        run: task proto-gen
+
+      - name: Ensure go.mod exists
+        run: |
+          if [ ! -f go.mod ]; then
+            go mod init git.sonicoriginal.software/grpc-protos
+          fi
+          go mod tidy
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Stage
+        run: git add --all --force
+
+      - name: Commit
+        run: git commit -m "Generate proto code at ${{ steps.version.outputs.VERSION }}"
+
+      - name: Tag
+        run: git tag ${{ steps.version.outputs.VERSION }}
+
+      - name: Push
+        run: |
+          git push origin gen
+          git push origin ${{ steps.version.outputs.VERSION }}
