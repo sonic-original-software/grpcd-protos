@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package grpcd;
+
+option go_package = "git.sonicoriginal.software/grpcd-protos;grpcd";
+
+// Service registration request
+message RegisterRequest {
+  // List of fully qualified method names this service handles
+  // e.g., ["principal.PrincipalService.GetPrincipal", "principal.PrincipalService.CreatePrincipal"]
+  repeated string methods = 1;
+}
+
+message RegisterResponse {}

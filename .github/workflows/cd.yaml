@@ -1,0 +1,14 @@
+name: CD
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - '*.*.*'
+      - '!v*'
+
+jobs:
+  gen:
+    uses: katastroma/skeuotheke/.github/workflows/release-buf-proto.yaml@v0
+    permissions:
+      contents: write

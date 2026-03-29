@@ -1,0 +1,12 @@
+version: v2
+
+plugins:
+  - remote: buf.build/protocolbuffers/go
+    out: go
+    opt:
+      - module=git.sonicoriginal.software/grpcd-protos
+
+  - remote: buf.build/grpc/go
+    out: go
+    opt:
+      - module=git.sonicoriginal.software/grpcd-protos
