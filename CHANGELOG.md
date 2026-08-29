@@ -2,6 +2,14 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## 0.2.0 - 2026-08-29
+#### Features
+- include server name when registering and deregistering - (c5681fb) - Nathan Blair
+#### Continuous Integration
+- fix release job name - (41e85e0) - Nathan Blair
+
+- - -
+
 ## 0.1.0 - 2026-03-29
 #### Features
 - initial re-release - (0d7ea60) - Nathan Blair
