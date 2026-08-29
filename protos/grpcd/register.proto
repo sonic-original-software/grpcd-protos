@@ -6,9 +6,13 @@ option go_package = "git.sonicoriginal.software/grpcd-protos;grpcd";
 
 // Service registration request
 message RegisterRequest {
+  // Name of the server registering, e.g. "principal". Replicas share it, so it
+  // names the service rather than the instance; the peer address does that.
+  string server_name = 1;
+
   // List of fully qualified method names this service handles
   // e.g., ["principal.PrincipalService.GetPrincipal", "principal.PrincipalService.CreatePrincipal"]
-  repeated string methods = 1;
+  repeated string methods = 2;
 }
 
 message RegisterResponse {}
