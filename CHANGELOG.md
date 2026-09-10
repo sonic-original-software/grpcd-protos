@@ -2,6 +2,12 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## 0.3.0 - 2026-09-10
+#### Features
+- use process-based deregistration - (02dbdbb) - Nathan Blair
+
+- - -
+
 ## 0.2.0 - 2026-08-29
 #### Features
 - include server name when registering and deregistering - (c5681fb) - Nathan Blair
