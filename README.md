@@ -2,40 +2,36 @@
 
 ## Purpose
 
-`grpcd` provides **method-to-address mapping** for the Cumulus microservices
-mesh. Services register their gRPC methods on startup; clients query `grpcd` to
-find which addresses serve specific methods.
+`grpcd` provides **method-to-address mapping** for a microservice mesh. Services
+hold a registration stream naming the methods they implement; clients query
+`grpcd` to find which addresses serve specific methods.
 
 **What `grpcd` Does:**
 
-- Accept method registrations from services
-- Store method → address mappings with TTL
-- Return addresses for method lookup queries
+- Accept registrations held open on a stream
+- Store method → addresses, removing an address when its stream ends
+- Answer lookups one candidate at a time
+- Remove an address a client reports it cannot reach
 
 **What `grpcd` Does NOT Do:**
 
 - Store proto descriptors (services expose via gRPC reflection)
-- Track connections or maintain state
-- Emit events or manage subscriptions
+- Health-check services
+- Push notifications to clients
 - Route traffic (gateway concern)
 
 ## Core Architecture
 
-### Stateless by Design
+### State lives in the storage backend
 
-`grpcd` instances are **completely stateless**:
+Every fact `grpcd` serves is in the storage backend, so any instance answers any
+lookup. An instance additionally holds the registration streams it accepted,
+which is what ties a row's lifetime to its service's.
 
-- No connection tracking
-- No in-memory state
-- No goroutines per connection
-- No peer discovery
-- No replication logic
+This enables:
 
-All state lives in the storage backend implmentation. This enables:
-
-- Infinite horizontal scaling
-- Instant crash recovery
-- Any instance serves any request
+- Horizontal scaling — instances are interchangeable for lookups
+- Crash recovery — a replacement instance serves immediately
 - Simple deployment
 
 ### Layered Architecture
@@ -46,9 +42,8 @@ All state lives in the storage backend implmentation. This enables:
 │                                        │
 │   ┌──────────────────────────────┐     │
 │   │     Service Layer            │     │
-│   │  • Register                  │     │
-│   │  • Discover                  │     │
-│   │  • Deregister                │     │
+│   │  • Register (held stream)    │     │
+│   │  • Discover (bidirectional)  │     │
 │   │  • Validation                │     │
 │   └──────────┬───────────────────┘     │
 │              │                         │
@@ -67,8 +62,8 @@ All state lives in the storage backend implmentation. This enables:
  └────────┘      └────────────┘
 ```
 
-Storage backend handles persistence, TTL expiry, and HA/replication. `grpcd`
-only implements business logic.
+Storage backend handles persistence and HA/replication. `grpcd` only implements
+business logic.
 
 ### Regional Deployment
 
@@ -78,7 +73,7 @@ Each geographic region runs an independent `grpcd` cluster:
 ┌───────────────────────┐         ┌───────────────────────┐
 │    us-east-1          │         │    eu-west-1          │
 │                       │         │                       │
-│  Load Balancer        │         │  Load Balancer        │
+│  regional DNS name    │         │  regional DNS name    │
 │        │              │         │        │              │
 │  ┌─────┴──────┬────┐  │         │  ┌─────┴──────┬────┐  │
 │  ▼            ▼    ▼  │         │  ▼            ▼    ▼  │
@@ -93,9 +88,9 @@ Each geographic region runs an independent `grpcd` cluster:
 ```
 
 - No cross-region state synchronization
-- DNS routes to regional cluster
+- `GRPCD_ADDRESS` names the regional cluster; which instance a service or client
+  reaches is whatever that name resolves to
 - Services register locally, clients discover locally
-- Follows Kubernetes regional cluster pattern
 
 ## Core Flows
 
@@ -103,116 +98,120 @@ Each geographic region runs an independent `grpcd` cluster:
 
 When a service starts:
 
-1. Service spawns background registration goroutine
-2. Goroutine makes Register RPC with list of methods it implements
-3. `grpcd` extracts real address from gRPC peer context (TCP connection)
-4. `grpcd` validates method names (must be fully qualified)
-5. `grpcd` stores each method → address mapping with configurable TTL
-6. `grpcd` stores reverse mapping (address → methods) for bulk cleanup
-7. RPC completes, connection closes
-8. Goroutine sleeps 5 minutes, re-registers to refresh TTL
-9. On graceful shutdown, goroutine calls Deregister before exit
+1. Service binds its listener and reads the port from it
+2. Service opens the `Register` stream, sending its name, its methods, and that
+   port
+3. `grpcd` extracts the IP from the gRPC peer context (TCP connection) and
+   composes the address
+4. `grpcd` validates method names (must be in gRPC wire format)
+5. `grpcd` adds the address to each method's set and stores the anchor: the id
+   of the instance holding this stream
+6. `grpcd` sends `RegisterResponse` and holds the stream open
+7. When the stream ends — clean shutdown, crash, or transport failure — `grpcd`
+   removes that address from every method the request named. The handler holds
+   that list for the life of the stream, so no reverse mapping is stored
 
-**Crash Handling:** If service crashes without deregistering, TTL expires and
-storage backend auto-deletes entries.
+A registration lives exactly as long as its stream. There is no interval to
+refresh and no deregistration call.
 
-### Client `grpcd`
+### Client Discovery
 
 When a client needs to call a method:
 
-1. Client checks local cache for method → address mapping
-2. On cache miss, client makes Discover RPC with method name
-3. `grpcd` validates method name
-4. `grpcd` queries storage for method → address
-5. `grpcd` returns address or NotFound error
-6. RPC completes, connection closes
-7. Client creates gRPC connection to discovered address
-8. Client queries gRPC reflection endpoint for proto descriptor
-9. Client caches (address + connection + descriptor)
-10. Client makes actual business call
-11. Client maintains health checks; on failure removes from cache and re-queries
+1. Client opens a `Discover` stream and sends the method name
+2. `grpcd` validates the method name
+3. `grpcd` answers with one candidate address from that method's set
+4. Client reaches that address and closes the stream
+5. If the client cannot reach the candidate it sends `dead_address`; `grpcd`
+   removes that address from the method being discovered and answers with the
+   next candidate. Other methods that address serves are removed the same way,
+   by a client failing on them
+6. With no candidates left, `grpcd` returns `NOT_FOUND`
 
-**Eventual Consistency:** Brief window where clients may discover dead addresses
-(crashed service, TTL not yet expired). Clients detect via health checks and
-re-query.
+The client watches the connection it took. When that connection breaks it opens
+a new `Discover` stream, reports the address dead, and takes the next candidate.
 
-### Service Deregistration
+### Reverting a Wrong Removal
 
-When a service shuts down gracefully:
+A client reporting an address dead may be wrong — its own network can be at
+fault while the service is healthy.
 
-1. Service context cancelled (SIGTERM)
-2. Registration goroutine calls Deregister RPC
-3. `grpcd` extracts address from gRPC peer context
-4. `grpcd` queries reverse mapping for all methods at that address
-5. `grpcd` deletes all method mappings atomically
-6. `grpcd` deletes reverse mapping
-7. RPC completes, connection closes
-8. Service exits
+The instance anchoring an address is notified when that row is removed, and
+writes it back. Its open `Register` stream is live proof the service is up, so
+it performs no check of its own.
 
-**Idempotent:** Can be called multiple times safely.
+A client with a persistent local fault drives a remove-and-restore cycle rather
+than losing the row. `grpcd` counts reverted removals so that surfaces in
+monitoring.
+
+### Losing the Storage Backend
+
+An instance that cannot reach the storage backend can neither record a
+registration nor answer a lookup, so it drops the registration streams it holds.
+Those services reconnect to a healthy instance, which records their rows under
+its own anchor.
 
 ## Key Design Decisions
 
 ### Peer Context Extraction
 
-`grpcd` extracts service addresses from **gRPC peer context** (TCP connection
+`grpcd` extracts the service's IP from **gRPC peer context** (TCP connection
 metadata), not from request fields.
 
 **Why:**
 
-- Address is cryptographically guaranteed by TCP handshake
+- Address is guaranteed by the TCP handshake
 - Cannot be spoofed by malicious services
 - Services cannot register methods for other addresses
-- Services don't need to know their own address
 - Prevents method hijacking attacks
+
+The port comes from the service, read from its listener so a bind to `:0`
+reports what it actually received. Neither party holds both halves: a
+containerized service does not know its reachable IP, and `grpcd` sees only an
+ephemeral source port.
 
 **Security Boundary:** Trust is at TCP connection establishment, not application
 layer.
 
-### TTL-Based Cleanup
+### Connection-Anchored Rows
 
-Storage backend automatically expires entries after configurable TTL. Services
-re-register periodically to refresh TTL.
+A row exists while its registration stream is held, and the stream ending
+removes it.
 
-**Alternatives Considered:**
+**Why:**
 
-- **Connection tracking:** `grpcd` monitors gRPC connections, cleans up on
-  disconnect
+- A dead service stops being discoverable when it dies, rather than after an
+  expiry window
+- No clock in the data, no refresh loop in every service, no deregistration RPC
+- The evidence is the connection, which `grpcd` already has
 
-  - Requires state (connection map per instance)
-  - Requires goroutines (per-connection lifecycle management)
-  - Makes `grpcd` stateful and complex
+**Tradeoff:** An instance holds one stream per registered service replica, so
+its memory grows with the mesh and instances are added to spread that. An
+instance crashing drops the streams it held, and those services reconnect
+elsewhere.
 
-- **Heartbeat protocol:** Services send periodic heartbeats, `grpcd` marks as
-  dead on timeout
-  - Requires state (heartbeat timestamps per instance)
-  - Requires goroutines (per-service timeout monitoring)
-  - More network overhead
+The one case the rule does not cover is a service and its anchoring instance
+dying together, leaving a row nothing will remove. That row is removed by the
+first client that fails against it.
 
-**TTL Wins:**
+### Many Addresses per Method
 
-- Zero state in `grpcd` (storage backend handles expiry)
-- Services self-manage lifecycle (re-registration in background)
-- Proven pattern (Consul, etcd, DNS)
-- Simple failure model
-
-**Tradeoff:** Dead services discoverable for up to TTL duration. Acceptable
-given simplicity gains and client health check mitigation.
+A method maps to a set of addresses. Replicas of one service all serve the same
+methods and each registers its own address, so removal takes one address out of
+the set and leaves the others.
 
 ### Storage Backend Abstraction
 
-`grpcd` delegates all persistence to pluggable storage backend.
+`grpcd` delegates all persistence to a pluggable storage backend.
 
 **Alternatives Considered:**
 
 - **Embedded storage (bbolt):**
-
   - Requires Raft consensus for HA
   - Requires complex distributed state management
   - Reinvents what Redis already does
 
 - **In-memory with peer sync:**
-
   - Requires gossip protocol between instances
   - Requires distributed state reconciliation
   - Race conditions, split-brain scenarios
@@ -230,8 +229,7 @@ given simplicity gains and client health check mitigation.
 - Testable (mock backend for unit tests)
 - Infrastructure team owns storage HA, not `grpcd` developers
 
-**Tradeoff:** External dependency (Redis must be available). Acceptable for
-operational simplicity.
+**Tradeoff:** External dependency. Its availability is the backend's concern.
 
 ### gRPC Reflection for Descriptors
 
@@ -240,30 +238,28 @@ fetch descriptors directly from services, not from `grpcd`.
 
 **Why `grpcd` Doesn't Store Descriptors:**
 
-- Descriptors are large (100KB+ per service)
+- Descriptors are large relative to an address
 - Descriptors are static (compiled into binaries)
 - Descriptors only change on service restart
-- `grpcd` stays lightweight (small footprint: 78 bytes per method)
+- `grpcd` stays lightweight
 - No blob storage complexity
 
-### No Events or Subscriptions
+### No Notifications to Clients
 
-`grpcd` provides pull-based lookup only, not push-based notifications.
+`grpcd` answers lookups and pushes nothing to clients.
 
-**Why No Pub/Sub:**
+**Why:**
 
-- Would require `grpcd` to track subscribers (stateful)
-- Would require connection lifecycle management
+- Would require `grpcd` to track subscribers
 - Would require event fanout logic
-- Adds distributed system complexity
-- Clients already health-check connections
+- A client holding a connection can watch that connection itself
 
-**Client-Managed Lifecycle:**
+**Client-Managed Lifecycle:** the client can hold the connection it discovered
+and watch it. When it breaks, the client discovers again and reports the address
+dead. What else it keeps alongside that connection is its own business.
 
-- Client caches `grpcd` results with connections
-- Client health-checks cached connections
-- On health check failure: remove from cache, re-query `grpcd`
-- Simpler than distributed event system
+Instances do notify each other about removals, over the storage backend's
+publish/subscribe, addressed to a single anchor.
 
 ### Regional Isolation
 
@@ -272,120 +268,115 @@ backend. No cross-region replication or state sync.
 
 **Why Regional, Not Global:**
 
-- Follows Kubernetes pattern (regional clusters, not global)
-- etcd manages single cluster, not global state
 - Latency: services discover local instances
 - Blast radius: regional failure doesn't affect other regions
 - Simplicity: no distributed state across continents
 
 **Multi-Region Pattern:**
 
-- DNS/load balancer routes to regional cluster
+- A regional DNS name resolves to that region's instances
 - Services register in their region
 - Clients discover in their region
 - Infrastructure handles geographic routing
 
-### Last-Writer-Wins
-
-When multiple services register the same method, last registration overwrites
-previous.
-
-**Why:**
-
-- Enables failover (new instance takes over methods)
-- Simple conflict resolution (no coordination)
-- Storage backend handles atomically (single SET operation)
-
-**Tradeoff:** No load balancing across multiple instances serving same method.
-`grpcd` returns single address, not list. Clients can retry with re-query for
-basic HA.
-
 ## Data Model
 
-`grpcd` stores two mappings in storage backend:
+`grpcd` stores two mappings in the storage backend:
 
-**Forward Mapping (method → address):**
+**Forward Mapping (method → addresses):**
 
 - Key: method name (fully qualified)
-- Value: network address
-- TTL: configurable (default 10 minutes)
-- Purpose: Lookup during Discover
+- Value: set of network addresses
+- Purpose: lookup during Discover
 
-**Reverse Mapping (address → methods):**
+**Anchor (address → instance id):**
 
 - Key: network address
-- Value: set of method names
-- TTL: same as forward mapping
-- Purpose: Bulk delete during Deregister
+- Value: id of the instance holding that address's `Register` stream
+- Purpose: addressing the notification when a row is removed
 
-**Storage Footprint:**
+No entry carries an expiry.
 
-- ~78 bytes per method mapping
-- 10,000 services × 5 methods = 50,000 mappings ≈ 4 MB
-- Negligible storage, fits in memory
+**Anchor ids:** an instance generates a UUIDv4 at startup and uses it as its
+anchor id and as its notification channel. The id names a channel that lives and
+dies with the process and is never referenced afterward, so it needs no
+coordination and no durability.
+
+**Storage Footprint:** a method name, an address, and an instance id per
+registered method.
 
 ## Validation
 
-Method names must be fully qualified (contain dots) to prevent ambiguity.
+Method names are gRPC wire format: a leading slash, the fully qualified service
+name, a slash, and the method name.
 
 **Valid Examples:**
 
-- service.Method
-- package.service.Method
-- deeply.nested.package.service.Method
+- `/Service/Method`
+- `/package.Service/Method`
+- `/deeply.nested.package.Service/Method`
 
 **Invalid Examples:**
 
-- Method (not qualified - which service?)
-- service..Method (consecutive dots)
-- .service.Method (leading dot)
-- service.Method. (trailing dot)
-- service. Method (whitespace)
+- `package.Service.Method` (no slashes)
+- `/package.Service/Method/` (trailing slash)
+- `package.Service/Method` (no leading slash)
+- `//package.Service/Method` (consecutive slashes)
+- `/package.Service/Get Method` (whitespace)
 
 **Rationale:**
 
+- This is the form that appears on the wire as the HTTP/2 `:path`, so a client
+  discovering a method has the string it will actually send
 - Prevents namespace collision (multiple "GetUser" methods)
-- Matches gRPC naming conventions
 - Enables future namespace-based routing/policies
 
 ## Failure Modes
 
+**Service Crash:**
+
+- Its `Register` stream ends and `grpcd` removes its address immediately
+- Clients holding a connection to it see that connection break and rediscover
+
 **`grpcd` Instance Crash:**
 
-- No state lost (stateless)
-- Other instances continue serving
-- Load balancer routes around failed instance
-- Recovery: restart instance, immediately operational
+- Its rows remain in the storage backend, because removal happens when an
+  instance observes a stream ending and this one is gone. Live services stay
+  discoverable throughout
+- Its registration streams break. Each of those services reconnects and
+  re-registers, adding its address to the same method sets — the same rows,
+  written again — and overwriting the anchor with the new instance's id
+- Until that re-registration lands, those rows carry the id of a channel nobody
+  reads. A removal in that window is not reverted, so a wrong `dead_address`
+  report can drop a live service until it re-registers
+- Other instances keep answering lookups, since every fact they serve is in the
+  storage backend
+
+**Service and Its Anchoring Instance Crash Together:**
+
+- Nothing runs the removal, so the row remains
+- The first client to discover that address fails against it and reports it,
+  which removes it
 
 **Storage Backend Failure:**
 
-- All `grpcd` instances fail lookups (no state)
-- Services continue operating with cached connections
-- On cache miss, clients receive errors
-- Recovery: restore storage backend, services re-register
-
-**Service Crash (No Deregister):**
-
-- Method mappings remain until TTL expires
-- Clients discover stale address
-- Client connection fails or health check fails
-- Client re-queries `grpcd`
-- Window: up to TTL duration
+- Instances drop their registration streams and stop serving
+- Services and clients continue on the connections they already hold
+- Recovery: restore storage backend, services reconnect and re-register
 
 **Network Partition:**
 
 - Regional isolation prevents cross-region impact
-- Within region: `grpcd` instances share storage backend
-- If `grpcd` can't reach storage: fails open (returns errors)
-- Services and clients use cached connections
+- Within region: an instance cut off from storage behaves as above
 
 ## Observability
 
 `grpcd` exposes business metrics via OpenTelemetry:
 
 - Total registrations (counter)
-- Total deregistrations (counter)
+- Total removals (counter)
 - Total discoveries (counter)
+- Reverted removals (counter)
 
 Standard observability endpoints:
 
@@ -399,10 +390,8 @@ Export metrics to Prometheus/Grafana for monitoring.
 `grpcd` configured entirely via environment variables (12-factor):
 
 - Storage backend type and address
-- TTL for method mappings (hot-read, no restart)
 - Server port and version
 
 Services connecting to `grpcd`:
 
 - `grpcd` cluster address (optional, disconnected mode if unset)
-- Re-registration interval (must be < TTL/2 for safety margin)

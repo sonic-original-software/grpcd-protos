@@ -4,14 +4,24 @@ package grpcd;
 
 option go_package = "git.sonicoriginal.software/grpcd-protos;grpcd";
 
-// Query for a specific method
+// Query for a method, and reports on the candidates it was answered with.
 message DiscoverRequest {
-  // The fully qualified method name (e.g., "principal.PrincipalService.CreatePrincipal")
-  string method_name = 1;
+  oneof step {
+    // First message: the fully qualified method name
+    // (e.g., "principal.PrincipalService.CreatePrincipal")
+    string method_name = 1;
+
+    // Subsequent messages: a candidate the client could not reach. grpcd
+    // removes it and answers with another.
+    string dead_address = 2;
+  }
 }
 
 message DiscoverResponse {
   // Address of a service that handles the requested method
   // e.g., "10.0.1.10:50054"
+  //
+  // One candidate per message. A client that reaches it closes the stream; a
+  // client that cannot reports it dead and is sent the next.
   string address = 1;
 }

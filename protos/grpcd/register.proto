@@ -4,15 +4,20 @@ package grpcd;
 
 option go_package = "git.sonicoriginal.software/grpcd-protos;grpcd";
 
-// Service registration request
+// Service registration request.
 message RegisterRequest {
   // Name of the server registering, e.g. "principal". Replicas share it, so it
-  // names the service rather than the instance; the peer address does that.
+  // names the service rather than the instance; the peer address identifies the instance.
   string server_name = 1;
 
   // List of fully qualified method names this service handles
-  // e.g., ["principal.PrincipalService.GetPrincipal", "principal.PrincipalService.CreatePrincipal"]
+  // e.g., ["server.Service.Method"]
   repeated string methods = 2;
+
+  // The port the service listens on.
+  uint32 port = 3;
 }
 
+// Sent once when the rows are written. The stream then carries nothing and is
+// held open; its ending is what removes them.
 message RegisterResponse {}
