@@ -126,7 +126,9 @@ When a client needs to call a method:
    removes that address from the method being discovered and answers with the
    next candidate. Other methods that address serves are removed the same way,
    by a client failing on them
-6. With no candidates left, `grpcd` returns `NOT_FOUND`
+6. With no candidates left, `grpcd` holds the stream open and offers the next
+   address registered for that method as it arrives. The client blocks on its
+   receive rather than asking again, and is woken by the registration
 
 The client watches the connection it took. When that connection breaks it opens
 a new `Discover` stream, reports the address dead, and takes the next candidate.
@@ -246,7 +248,9 @@ fetch descriptors directly from services, not from `grpcd`.
 
 ### No Notifications to Clients
 
-`grpcd` answers lookups and pushes nothing to clients.
+`grpcd` answers lookups and pushes nothing to clients. A Discover that is
+waiting for a registration is still a lookup the client opened and is holding
+for an answer — nothing reaches a client that did not ask.
 
 **Why:**
 
