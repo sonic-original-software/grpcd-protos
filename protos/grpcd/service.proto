@@ -4,6 +4,7 @@ package grpcd;
 
 import "grpcd/discover.proto";
 import "grpcd/register.proto";
+import "grpcd/watch.proto";
 
 option go_package = "git.sonicoriginal.software/grpcd-protos;grpcd";
 
@@ -14,4 +15,7 @@ service GRPCDService {
 
   // Discover addresses for a method, one candidate at a time.
   rpc Discover(stream grpcd.DiscoverRequest) returns (stream grpcd.DiscoverResponse);
+
+  // Hold an address for a method and be told when to move to another.
+  rpc Watch(grpcd.WatchRequest) returns (stream grpcd.WatchResponse);
 }

@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package grpcd;
+
+option go_package = "git.sonicoriginal.software/grpcd-protos;grpcd";
+
+// Says which address the client holds for which method, and asks to be told
+// when it should move.
+message WatchRequest {
+  // The fully qualified method name the client discovered
+  // (e.g., "/package.Service/Method").
+  string method_name = 1;
+
+  // The address the client is connected to for it.
+  string address = 2;
+}
+
+// An address the client should move to. Sent when a new address registers for
+// the method, to a share of the clients holding other addresses, so the new
+// replica takes its share without every client moving. The client probes it,
+// moves, and opens a new Watch naming it.
+message WatchResponse {
+  string address = 1;
+}

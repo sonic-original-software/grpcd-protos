@@ -6,19 +6,12 @@
 hold a registration stream naming the methods they implement; clients query
 `grpcd` to find which addresses serve specific methods.
 
-**What `grpcd` Does:**
-
 - Accept registrations held open on a stream
 - Store method → addresses, removing an address when its stream ends
 - Answer lookups one candidate at a time
 - Remove an address a client reports it cannot reach
-
-**What `grpcd` Does NOT Do:**
-
-- Store proto descriptors (services expose via gRPC reflection)
-- Health-check services
-- Push notifications to clients
-- Route traffic (gateway concern)
+- Tell a share of the clients holding a method's address when a new one
+  registers
 
 ## Core Architecture
 
@@ -44,6 +37,7 @@ This enables:
 │   │     Service Layer            │     │
 │   │  • Register (held stream)    │     │
 │   │  • Discover (bidirectional)  │     │
+│   │  • Watch (held stream)       │     │
 │   │  • Validation                │     │
 │   └──────────┬───────────────────┘     │
 │              │                         │
@@ -120,9 +114,9 @@ When a client needs to call a method:
 
 1. Client opens a `Discover` stream and sends the method name
 2. `grpcd` validates the method name
-3. `grpcd` answers with one candidate address drawn at random from that
-   method's set, so clients discovering the same method spread across its
-   replicas rather than all taking the same one
+3. `grpcd` answers with one candidate address drawn at random from that method's
+   set, so clients discovering the same method spread across its replicas rather
+   than all taking the same one
 4. Client reaches that address and closes the stream
 5. If the client cannot reach the candidate it sends `dead_address`; `grpcd`
    removes that address from the method being discovered and answers with the
@@ -134,6 +128,30 @@ When a client needs to call a method:
 
 The client watches the connection it took. When that connection breaks it opens
 a new `Discover` stream, reports the address dead, and takes the next candidate.
+
+### Rebalancing
+
+A client holds the address `Discover` gave it until that address dies, so a
+replica registered later would receive nothing from the clients already
+connected. `Watch` is how those clients learn about it:
+
+1. Client connects to the address `Discover` gave it and opens `Watch` naming
+   the method and that address, before closing `Discover`, so no registration
+   falls between the two
+2. `grpcd` holds the stream and sleeps until a registration is announced
+3. On an addition for that method whose address differs from the one held,
+   `grpcd` draws with probability `1/N`, `N` being the method's address count
+   after the addition, and sends the new address to the winners only. Everyone
+   else hears nothing
+4. A client sent an address probes it. Reachable: it moves, opens a new `Watch`
+   naming the new address, then closes the old one. Unreachable: it stays and
+   reports nothing; the next fresh `Discover` to land on that address reports it
+
+Each client decides alone, and the expected share of clients moving is the new
+replica's fair share, so the spread stays even and `1/N` of the connections
+reconnect rather than all of them. Two additions back to back can cost one
+missed rebalance, which the next addition corrects; the store's set is the
+truth throughout.
 
 ### Reverting a Wrong Removal
 
@@ -248,23 +266,25 @@ fetch descriptors directly from services, not from `grpcd`.
 - `grpcd` stays lightweight
 - No blob storage complexity
 
-### No Notifications to Clients
+### Notifications Only to a Held Stream
 
-`grpcd` answers lookups and pushes nothing to clients. A Discover that is
-waiting for a registration is still a lookup the client opened and is holding
-for an answer — nothing reaches a client that did not ask.
+`grpcd` pushes to a client only on a stream that client opened and is holding:
+a `Discover` waiting for a registration, or a `Watch` naming an address it
+holds. Nothing reaches a client that did not ask.
 
-**Why:**
+**Why this costs no registry:** every registration is announced once per
+instance, over one subscription to the storage backend, and every handler
+waiting on that instance is woken by that one announcement. Each woken handler
+reads the store to learn whether the registration concerned it. No instance
+holds a list of who is waiting for what.
 
-- Would require `grpcd` to track subscribers
-- Would require event fanout logic
-- A client holding a connection can watch that connection itself
+**Client-Managed Lifecycle:** the client holds the connection `Discover` gave
+it and a `Watch` naming it. When the connection breaks, the client discovers
+again and reports the address dead. When the `Watch` stream breaks, the client
+opens a new one naming the same address. What else it keeps alongside that
+connection is its own business.
 
-**Client-Managed Lifecycle:** the client can hold the connection it discovered
-and watch it. When it breaks, the client discovers again and reports the address
-dead. What else it keeps alongside that connection is its own business.
-
-Instances do notify each other about removals, over the storage backend's
+Instances also notify each other about removals, over the storage backend's
 publish/subscribe, addressed to a single anchor.
 
 ### Regional Isolation
@@ -293,7 +313,8 @@ backend. No cross-region replication or state sync.
 
 - Key: method name (fully qualified)
 - Value: set of network addresses
-- Purpose: lookup during Discover
+- Purpose: lookup during Discover; its cardinality is the `N` a Watch draws
+  against
 
 **Anchor (address → instance id):**
 
