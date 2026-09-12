@@ -2,6 +2,15 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## 0.4.0 - 2026-09-12
+#### Features
+- add Watch rpc - (e0d855f) - Nathan Blair
+#### Documentation
+- express contract for random load balancing returned addresses - (addb604) - Nathan Blair
+- mention that grpcd will wait to receive more methods to forward - (a5fb7dd) - Nathan Blair
+
+- - -
+
 ## 0.3.0 - 2026-09-10
 #### Features
 - use process-based deregistration - (02dbdbb) - Nathan Blair
