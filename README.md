@@ -1,361 +1,29 @@
-# grpcd - Architectural Overview
+# grpcd protocol
 
-## Purpose
+The contract between a grpcd server and the services and clients that talk to
+it. Three RPCs, defined in `protos/grpcd/`, and the rules an implementation of
+either side honors.
 
-`grpcd` provides **method-to-address mapping** for a microservice mesh. Services
-hold a registration stream naming the methods they implement; clients query
-`grpcd` to find which addresses serve specific methods.
+## Installation
 
-- Accept registrations held open on a stream
-- Store method → addresses, removing an address when its stream ends
-- Answer lookups one candidate at a time
-- Remove an address a client reports it cannot reach
-- Tell a share of the clients holding a method's address when a new one
-  registers
-
-## Core Architecture
-
-### State lives in the storage backend
-
-Every fact `grpcd` serves is in the storage backend, so any instance answers any
-lookup. An instance additionally holds the registration streams it accepted,
-which is what ties a row's lifetime to its service's.
-
-This enables:
-
-- Horizontal scaling — instances are interchangeable for lookups
-- Crash recovery — a replacement instance serves immediately
-- Simple deployment
-
-### Layered Architecture
-
-```
-┌────────────────────────────────────────┐
-│           `grpcd` Service              │
-│                                        │
-│   ┌──────────────────────────────┐     │
-│   │     Service Layer            │     │
-│   │  • Register (held stream)    │     │
-│   │  • Discover (bidirectional)  │     │
-│   │  • Watch (held stream)       │     │
-│   │  • Validation                │     │
-│   └──────────┬───────────────────┘     │
-│              │                         │
-│   ┌──────────▼───────────────────┐     │
-│   │   Storage Interface          │     │
-│   │  (abstract backend)          │     │
-│   └──────────┬───────────────────┘     │
-│              │                         │
-└──────────────┼─────────────────────────┘
-               │
-     ┌─────────┴─────────┐
-     │                   │
- ┌───▼────┐      ┌───────▼────┐
- │ Redis  │      │    Mock    │
- │Backend │      │  (Testing) │
- └────────┘      └────────────┘
+```bash
+go get github.com/grpcd/protos
 ```
 
-Storage backend handles persistence and HA/replication. `grpcd` only implements
-business logic.
+The generated Go lives at the module root, package `grpcd`.
 
-### Regional Deployment
+## Method Names
 
-Each geographic region runs an independent `grpcd` cluster:
+Every method name on the wire is gRPC wire format: a leading slash, the fully
+qualified service name, a slash, and the method name.
 
-```
-┌───────────────────────┐         ┌───────────────────────┐
-│    us-east-1          │         │    eu-west-1          │
-│                       │         │                       │
-│  regional DNS name    │         │  regional DNS name    │
-│        │              │         │        │              │
-│  ┌─────┴──────┬────┐  │         │  ┌─────┴──────┬────┐  │
-│  ▼            ▼    ▼  │         │  ▼            ▼    ▼  │
-│ D-1          D-2  ... │         │ D-1          D-2  ... │
-│  │            │    │  │         │  │            │    │  │
-│  └─────┬──────┘    │  │         │  └─────┬──────┘    │  │
-│        ▼           │  │         │        ▼           │  │
-│   ┌──────────┐     │  │         │   ┌──────────┐     │  │
-│   │  Redis   │     │  │         │   │  Redis   │     │  │
-│   └──────────┘     │  │         │   └──────────┘     │  │
-└───────────────────────┘         └───────────────────────┘
-```
-
-- No cross-region state synchronization
-- `GRPCD_ADDRESS` names the regional cluster; which instance a service or client
-  reaches is whatever that name resolves to
-- Services register locally, clients discover locally
-
-## Core Flows
-
-### Service Registration
-
-When a service starts:
-
-1. Service binds its listener and reads the port from it
-2. Service opens the `Register` stream, sending its name, its methods, and that
-   port
-3. `grpcd` extracts the IP from the gRPC peer context (TCP connection) and
-   composes the address
-4. `grpcd` validates method names (must be in gRPC wire format)
-5. `grpcd` adds the address to each method's set and stores the anchor: the id
-   of the instance holding this stream
-6. `grpcd` sends `RegisterResponse` and holds the stream open
-7. When the stream ends — clean shutdown, crash, or transport failure — `grpcd`
-   removes that address from every method the request named. The handler holds
-   that list for the life of the stream, so no reverse mapping is stored
-
-A registration lives exactly as long as its stream. There is no interval to
-refresh and no deregistration call.
-
-### Client Discovery
-
-When a client needs to call a method:
-
-1. Client opens a `Discover` stream and sends the method name
-2. `grpcd` validates the method name
-3. `grpcd` answers with one candidate address drawn at random from that method's
-   set, so clients discovering the same method spread across its replicas rather
-   than all taking the same one
-4. Client reaches that address and closes the stream
-5. If the client cannot reach the candidate it sends `dead_address`; `grpcd`
-   removes that address from the method being discovered and answers with the
-   next candidate. Other methods that address serves are removed the same way,
-   by a client failing on them
-6. With no candidates left, `grpcd` holds the stream open and offers the next
-   address registered for that method as it arrives. The client blocks on its
-   receive rather than asking again, and is woken by the registration
-
-The client watches the connection it took. When that connection breaks it opens
-a new `Discover` stream, reports the address dead, and takes the next candidate.
-
-### Rebalancing
-
-A client holds the address `Discover` gave it until that address dies, so a
-replica registered later would receive nothing from the clients already
-connected. `Watch` is how those clients learn about it:
-
-1. Client connects to the address `Discover` gave it and opens `Watch` naming
-   the method and that address, before closing `Discover`, so no registration
-   falls between the two
-2. `grpcd` holds the stream and sleeps until a registration is announced
-3. On an addition for that method whose address differs from the one held,
-   `grpcd` draws with probability `1/N`, `N` being the method's address count
-   after the addition, and sends the new address to the winners only. Everyone
-   else hears nothing
-4. A client sent an address probes it. Reachable: it moves, opens a new `Watch`
-   naming the new address, then closes the old one. Unreachable: it stays and
-   reports nothing; the next fresh `Discover` to land on that address reports it
-
-Each client decides alone, and the expected share of clients moving is the new
-replica's fair share, so the spread stays even and `1/N` of the connections
-reconnect rather than all of them. Two additions back to back can cost one
-missed rebalance, which the next addition corrects; the store's set is the
-truth throughout.
-
-### Reverting a Wrong Removal
-
-A client reporting an address dead may be wrong — its own network can be at
-fault while the service is healthy.
-
-The instance anchoring an address is notified when that row is removed, and
-writes it back. Its open `Register` stream is live proof the service is up, so
-it performs no check of its own.
-
-A client with a persistent local fault drives a remove-and-restore cycle rather
-than losing the row. `grpcd` counts reverted removals so that surfaces in
-monitoring.
-
-### Losing the Storage Backend
-
-An instance that cannot reach the storage backend can neither record a
-registration nor answer a lookup, and is deaf to additions. It keeps serving
-and says so: its health entry for `grpcd.GRPCDService` reports `NOT_SERVING`
-until the backend's subscription comes back. Whatever routes to the instance
-reads that and decides whether to keep sending clients; the `""` entry stays
-`SERVING`, since the process is alive.
-
-The streams it holds are kept. A handler that fails against the backend waits
-for it to return and carries on: a registration is written once it can be, a
-lookup draws again, a watch resumes. A client already on the instance sees a
-call take longer and nothing else.
-
-When the backend returns, every held registration writes its rows again from
-the request the handler still holds, so a backend that came back empty is
-repopulated by the instances themselves. Waiting lookups draw again, since the
-backend may hold registrations the instance was deaf to.
-
-## Key Design Decisions
-
-### Peer Context Extraction
-
-`grpcd` extracts the service's IP from **gRPC peer context** (TCP connection
-metadata), not from request fields.
-
-**Why:**
-
-- Address is guaranteed by the TCP handshake
-- Cannot be spoofed by malicious services
-- Services cannot register methods for other addresses
-- Prevents method hijacking attacks
-
-The port comes from the service, read from its listener so a bind to `:0`
-reports what it actually received. Neither party holds both halves: a
-containerized service does not know its reachable IP, and `grpcd` sees only an
-ephemeral source port.
-
-**Security Boundary:** Trust is at TCP connection establishment, not application
-layer.
-
-### Connection-Anchored Rows
-
-A row exists while its registration stream is held, and the stream ending
-removes it.
-
-**Why:**
-
-- A dead service stops being discoverable when it dies, rather than after an
-  expiry window
-- No clock in the data, no refresh loop in every service, no deregistration RPC
-- The evidence is the connection, which `grpcd` already has
-
-**Tradeoff:** An instance holds one stream per registered service replica, so
-its memory grows with the mesh and instances are added to spread that. An
-instance crashing drops the streams it held, and those services reconnect
-elsewhere.
-
-The one case the rule does not cover is a service and its anchoring instance
-dying together, leaving a row nothing will remove. That row is removed by the
-first client that fails against it.
-
-### Many Addresses per Method
-
-A method maps to a set of addresses. Replicas of one service all serve the same
-methods and each registers its own address, so removal takes one address out of
-the set and leaves the others.
-
-### Storage Backend Abstraction
-
-`grpcd` delegates all persistence to a pluggable storage backend.
-
-**Alternatives Considered:**
-
-- **Embedded storage (bbolt):**
-  - Requires Raft consensus for HA
-  - Requires complex distributed state management
-  - Reinvents what Redis already does
-
-- **In-memory with peer sync:**
-  - Requires gossip protocol between instances
-  - Requires distributed state reconciliation
-  - Race conditions, split-brain scenarios
-
-- **Direct Redis dependency:**
-  - Tight coupling to Redis specifics
-  - Hard to test (no mock)
-  - No flexibility for other backends
-
-**Backend Abstraction Wins:**
-
-- `grpcd` stays simple (just business logic)
-- Default backend is battle-tested (Redis/Valkey)
-- Clear separation of concerns (business vs persistence)
-- Testable (mock backend for unit tests)
-- Infrastructure team owns storage HA, not `grpcd` developers
-
-**Tradeoff:** External dependency. Its availability is the backend's concern.
-
-### gRPC Reflection for Descriptors
-
-Services expose proto descriptors via standard gRPC reflection API. Clients
-fetch descriptors directly from services, not from `grpcd`.
-
-**Why `grpcd` Doesn't Store Descriptors:**
-
-- Descriptors are large relative to an address
-- Descriptors are static (compiled into binaries)
-- Descriptors only change on service restart
-- `grpcd` stays lightweight
-- No blob storage complexity
-
-### Notifications Only to a Held Stream
-
-`grpcd` pushes to a client only on a stream that client opened and is holding:
-a `Discover` waiting for a registration, or a `Watch` naming an address it
-holds. Nothing reaches a client that did not ask.
-
-**Why this costs no registry:** every registration is announced once per
-instance, over one subscription to the storage backend, and every handler
-waiting on that instance is woken by that one announcement. Each woken handler
-reads the store to learn whether the registration concerned it. No instance
-holds a list of who is waiting for what.
-
-**Client-Managed Lifecycle:** the client holds the connection `Discover` gave
-it and a `Watch` naming it. When the connection breaks, the client discovers
-again and reports the address dead. When the `Watch` stream breaks, the client
-opens a new one naming the same address. What else it keeps alongside that
-connection is its own business.
-
-Instances also notify each other about removals, over the storage backend's
-publish/subscribe, addressed to a single anchor.
-
-### Regional Isolation
-
-Each geographic region runs an independent `grpcd` cluster with its own storage
-backend. No cross-region replication or state sync.
-
-**Why Regional, Not Global:**
-
-- Latency: services discover local instances
-- Blast radius: regional failure doesn't affect other regions
-- Simplicity: no distributed state across continents
-
-**Multi-Region Pattern:**
-
-- A regional DNS name resolves to that region's instances
-- Services register in their region
-- Clients discover in their region
-- Infrastructure handles geographic routing
-
-## Data Model
-
-`grpcd` stores two mappings in the storage backend:
-
-**Forward Mapping (method → addresses):**
-
-- Key: method name (fully qualified)
-- Value: set of network addresses
-- Purpose: lookup during Discover; its cardinality is the `N` a Watch draws
-  against
-
-**Anchor (address → instance id):**
-
-- Key: network address
-- Value: id of the instance holding that address's `Register` stream
-- Purpose: addressing the notification when a row is removed
-
-No entry carries an expiry.
-
-**Anchor ids:** an instance generates a UUIDv4 at startup and uses it as its
-anchor id and as its notification channel. The id names a channel that lives and
-dies with the process and is never referenced afterward, so it needs no
-coordination and no durability.
-
-**Storage Footprint:** a method name, an address, and an instance id per
-registered method.
-
-## Validation
-
-Method names are gRPC wire format: a leading slash, the fully qualified service
-name, a slash, and the method name.
-
-**Valid Examples:**
+Valid:
 
 - `/Service/Method`
 - `/package.Service/Method`
 - `/deeply.nested.package.Service/Method`
 
-**Invalid Examples:**
+Invalid:
 
 - `package.Service.Method` (no slashes)
 - `/package.Service/Method/` (trailing slash)
@@ -363,76 +31,99 @@ name, a slash, and the method name.
 - `//package.Service/Method` (consecutive slashes)
 - `/package.Service/Get Method` (whitespace)
 
-**Rationale:**
+This is the form that appears as the HTTP/2 `:path`, so a client discovering a
+method holds the string it will send. The server rejects anything else with
+`INVALID_ARGUMENT`.
 
-- This is the form that appears on the wire as the HTTP/2 `:path`, so a client
-  discovering a method has the string it will actually send
-- Prevents namespace collision (multiple "GetUser" methods)
-- Enables future namespace-based routing/policies
+## Addresses
 
-## Failure Modes
+An address is `host:port`. The server composes it: the IP comes from the peer
+of the `Register` connection, the port from the request. Neither party holds
+both halves. A containerized service does not know its reachable IP, and the
+server sees only the ephemeral source port of the connection. Reading the IP
+off the connection also means a service can register only the address it
+actually connected from.
 
-**Service Crash:**
+A method maps to a set of addresses. Replicas of one service serve the same
+methods and each registers its own address, so removing one leaves the others.
 
-- Its `Register` stream ends and `grpcd` removes its address immediately
-- Clients holding a connection to it see that connection break and rediscover
+## Register
 
-**`grpcd` Instance Crash:**
+```proto
+rpc Register(RegisterRequest) returns (stream RegisterResponse);
+```
 
-- Its rows remain in the storage backend, because removal happens when an
-  instance observes a stream ending and this one is gone. Live services stay
-  discoverable throughout
-- Its registration streams break. Each of those services reconnects and
-  re-registers, adding its address to the same method sets — the same rows,
-  written again — and overwriting the anchor with the new instance's id
-- Until that re-registration lands, those rows carry the id of a channel nobody
-  reads. A removal in that window is not reverted, so a wrong `dead_address`
-  report can drop a live service until it re-registers
-- Other instances keep answering lookups, since every fact they serve is in the
-  storage backend
+The request carries the service's name, its method list, and its listening
+port. The server writes one row per method, sends one empty `RegisterResponse`,
+and holds the stream. The stream then carries nothing.
 
-**Service and Its Anchoring Instance Crash Together:**
+The registration is the stream. When it ends, by clean shutdown, crash, or
+transport failure, the server removes every row the request named. There is no
+refresh, no expiry, and no deregistration RPC; a service that crashes and one
+that exits cleanly take the same path.
 
-- Nothing runs the removal, so the row remains
-- The first client to discover that address fails against it and reports it,
-  which removes it
+`server_name` names the service, not the instance. Replicas share it; the
+address identifies the instance.
 
-**Storage Backend Failure:**
+A `Register` naming no methods, or a port outside 1–65535, is rejected with
+`INVALID_ARGUMENT`.
 
-- Instances report `grpcd.GRPCDService` as `NOT_SERVING` and hold their
-  streams; handlers wait for the backend rather than failing
-- Services and clients continue on the connections they already hold
-- Recovery: the backend's subscription comes back, held registrations rewrite
-  their rows, waiting lookups draw again
+## Discover
 
-**Network Partition:**
+```proto
+rpc Discover(stream DiscoverRequest) returns (stream DiscoverResponse);
+```
 
-- Regional isolation prevents cross-region impact
-- Within region: an instance cut off from storage behaves as above
+The client's first message is `method_name`. The server answers with one
+candidate address, drawn at random from the method's set, so clients
+discovering the same method spread across its replicas.
 
-## Observability
+The client reaches the candidate. If it can, it closes the stream. If it
+cannot, it sends `dead_address` naming the candidate; the server removes that
+address from the method and answers with the next.
 
-`grpcd` exposes business metrics via OpenTelemetry:
+When the set is empty the server holds the stream and answers with the next
+address registered for the method as it arrives. The client blocks on its
+receive rather than asking again.
 
-- Total registrations (counter)
-- Total removals (counter)
-- Total discoveries (counter)
-- Reverted removals (counter)
+A client holds the address it took until the transport to it drops. It then
+opens a new `Discover`, reports the address dead, and takes the next candidate.
 
-Standard observability endpoints:
+## Watch
 
-- Metadata: service name and version
-- Diagnostics: storage connectivity, instance health
+```proto
+rpc Watch(WatchRequest) returns (stream WatchResponse);
+```
 
-Export metrics to Prometheus/Grafana for monitoring.
+The request names a method and the address the client holds for it. The server
+holds the stream.
 
-## Configuration
+When a new address registers for the method, the server sends it to a share of
+the clients holding other addresses: each holder is chosen with probability
+`1/N`, `N` being the method's address count after the addition. The rest hear
+nothing. The expected share of clients moving is the new replica's fair share,
+so a new replica takes its part of existing connections without every client
+reconnecting.
 
-`grpcd` configured entirely via environment variables (12-factor):
+A client sent an address probes it. Reachable: it moves, opens a new `Watch`
+naming the new address, and closes the old one. Unreachable: it stays and
+reports nothing.
 
-- Storage backend type and address
-- Server port and version
+A client opens `Watch` before closing the `Discover` that gave it the address,
+and opens the new `Watch` before closing the old one, so no registration falls
+between the two.
 
-Services connecting to `grpcd`:
+## Notifications
 
-- `grpcd` cluster address (optional, disconnected mode if unset)
+The server pushes to a client only on a stream that client opened and holds: a
+`Discover` waiting for a registration, or a `Watch` naming an address it holds.
+When the `Watch` stream breaks, the client opens a new one naming the same
+address.
+
+## Removal Is Reversible
+
+A client reporting an address dead may be wrong; its own network can be at
+fault while the service is healthy. The server treats the open `Register`
+stream as proof the service is up and writes the row back. A client with a
+persistent local fault drives a remove-and-restore cycle rather than losing the
+row for everyone.
