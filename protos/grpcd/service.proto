@@ -6,7 +6,7 @@ import "grpcd/discover.proto";
 import "grpcd/register.proto";
 import "grpcd/watch.proto";
 
-option go_package = "git.sonicoriginal.software/grpcd-protos;grpcd";
+option go_package = "github.com/grpcd/protos;grpcd";
 
 // GRPCDService handles service registration and method discovery
 service GRPCDService {

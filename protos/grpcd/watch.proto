@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package grpcd;
 
-option go_package = "git.sonicoriginal.software/grpcd-protos;grpcd";
+option go_package = "github.com/grpcd/protos;grpcd";
 
 // Says which address the client holds for which method, and asks to be told
 // when it should move.

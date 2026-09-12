@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package grpcd;
 
-option go_package = "git.sonicoriginal.software/grpcd-protos;grpcd";
+option go_package = "github.com/grpcd/protos;grpcd";
 
 // Query for a method, and reports on the candidates it was answered with.
 message DiscoverRequest {

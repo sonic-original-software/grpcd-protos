@@ -1,4 +1,4 @@
-module git.sonicoriginal.software/grpcd-protos
+module github.com/grpcd/protos
 
 go 1.26.1
 
