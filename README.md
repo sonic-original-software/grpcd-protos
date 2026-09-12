@@ -120,7 +120,9 @@ When a client needs to call a method:
 
 1. Client opens a `Discover` stream and sends the method name
 2. `grpcd` validates the method name
-3. `grpcd` answers with one candidate address from that method's set
+3. `grpcd` answers with one candidate address drawn at random from that
+   method's set, so clients discovering the same method spread across its
+   replicas rather than all taking the same one
 4. Client reaches that address and closes the stream
 5. If the client cannot reach the candidate it sends `dead_address`; `grpcd`
    removes that address from the method being discovered and answers with the
