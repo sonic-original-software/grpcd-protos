@@ -169,9 +169,21 @@ monitoring.
 ### Losing the Storage Backend
 
 An instance that cannot reach the storage backend can neither record a
-registration nor answer a lookup, so it drops the registration streams it holds.
-Those services reconnect to a healthy instance, which records their rows under
-its own anchor.
+registration nor answer a lookup, and is deaf to additions. It keeps serving
+and says so: its health entry for `grpcd.GRPCDService` reports `NOT_SERVING`
+until the backend's subscription comes back. Whatever routes to the instance
+reads that and decides whether to keep sending clients; the `""` entry stays
+`SERVING`, since the process is alive.
+
+The streams it holds are kept. A handler that fails against the backend waits
+for it to return and carries on: a registration is written once it can be, a
+lookup draws again, a watch resumes. A client already on the instance sees a
+call take longer and nothing else.
+
+When the backend returns, every held registration writes its rows again from
+the request the handler still holds, so a backend that came back empty is
+repopulated by the instances themselves. Waiting lookups draw again, since the
+backend may hold registrations the instance was deaf to.
 
 ## Key Design Decisions
 
@@ -387,9 +399,11 @@ name, a slash, and the method name.
 
 **Storage Backend Failure:**
 
-- Instances drop their registration streams and stop serving
+- Instances report `grpcd.GRPCDService` as `NOT_SERVING` and hold their
+  streams; handlers wait for the backend rather than failing
 - Services and clients continue on the connections they already hold
-- Recovery: restore storage backend, services reconnect and re-register
+- Recovery: the backend's subscription comes back, held registrations rewrite
+  their rows, waiting lookups draw again
 
 **Network Partition:**
 
